@@ -24,3 +24,8 @@ web_custom_versions/
 filtered-openapi.yaml
 uv.lock
 .comfy_environment
+
+# AWS Neuron / torch_xla runtime artifacts
+comfyui.pid
+.neuron_cache/
+PostSPMDPassesExecutionDuration.txt

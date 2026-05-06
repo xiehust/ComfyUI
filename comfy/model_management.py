@@ -146,8 +146,29 @@ try:
 except:
     ixuca_available = False
 
+# AWS Neuron (Inferentia / Trainium) via torch_xla PJRT.
+# We treat the "xla" device as Neuron when /dev/neuron* is present.
+neuron_available = False
+_neuron_device = None
+try:
+    if any(name.startswith("neuron") for name in os.listdir("/dev")):
+        os.environ.setdefault("PJRT_DEVICE", "NEURON")
+        import torch_xla  # noqa: F401
+        import torch_xla.core.xla_model as _xm  # noqa: F401
+        _neuron_device = _xm.xla_device()
+        neuron_available = True
+except Exception:
+    neuron_available = False
+    _neuron_device = None
+
 if args.cpu:
     cpu_state = CPUState.CPU
+
+if getattr(args, "neuron", False) and not neuron_available:
+    raise RuntimeError(
+        "--neuron was passed but torch_xla / torch_neuronx failed to initialize. "
+        "Check that /dev/neuron* exists and PJRT_DEVICE=NEURON is set before launch."
+    )
 
 def is_intel_xpu():
     global cpu_state
@@ -172,6 +193,12 @@ def is_mlu():
 def is_ixuca():
     global ixuca_available
     if ixuca_available:
+        return True
+    return False
+
+def is_neuron():
+    global neuron_available, cpu_state
+    if cpu_state == CPUState.GPU and neuron_available:
         return True
     return False
 
@@ -200,6 +227,8 @@ def get_torch_device():
             return torch.device("npu", torch.npu.current_device())
         elif is_mlu():
             return torch.device("mlu", torch.mlu.current_device())
+        elif is_neuron():
+            return _neuron_device
         else:
             return torch.device(torch.cuda.current_device())
 
@@ -233,6 +262,14 @@ def get_total_memory(dev=None, torch_total_too=False):
             _, mem_total_mlu = torch.mlu.mem_get_info(dev)
             mem_total_torch = mem_reserved
             mem_total = mem_total_mlu
+        elif is_neuron():
+            import torch_xla.core.xla_model as _xm
+            try:
+                info = _xm.get_memory_info(dev)
+                mem_total = int(info["bytes_limit"])
+            except Exception:
+                mem_total = 32 * 1024 * 1024 * 1024  # per-device HBM on inf2/trn1
+            mem_total_torch = mem_total
         else:
             stats = torch.cuda.memory_stats(dev)
             mem_reserved = stats['reserved_bytes.all.current']
@@ -314,6 +351,13 @@ def is_nvidia():
     global cpu_state
     if cpu_state == CPUState.GPU:
         if torch.version.cuda:
+            # torch may be built against CUDA (e.g. the cu126 wheel used on
+            # Neuron hosts) without an actual NVIDIA driver being present.
+            try:
+                if not torch.cuda.is_available():
+                    return False
+            except Exception:
+                return False
             return True
     return False
 
@@ -1443,6 +1487,8 @@ def xformers_enabled():
         return False
     if is_ixuca():
         return False
+    if is_neuron():
+        return False
     if directml_enabled:
         return False
     return XFORMERS_IS_AVAILABLE
@@ -1527,6 +1573,14 @@ def get_free_memory(dev=None, torch_free_too=False):
             mem_free_mlu, _ = torch.mlu.mem_get_info(dev)
             mem_free_torch = mem_reserved - mem_active
             mem_free_total = mem_free_mlu + mem_free_torch
+        elif is_neuron():
+            import torch_xla.core.xla_model as _xm
+            try:
+                info = _xm.get_memory_info(dev)
+                mem_free_total = int(info["bytes_limit"] - info["bytes_used"])
+            except Exception:
+                mem_free_total = 16 * 1024 * 1024 * 1024  # conservative half-HBM
+            mem_free_torch = mem_free_total
         else:
             stats = torch.cuda.memory_stats(dev)
             mem_active = stats['active_bytes.all.current']
@@ -1566,6 +1620,9 @@ def is_device_xpu(device):
 def is_device_cuda(device):
     return is_device_type(device, 'cuda')
 
+def is_device_neuron(device):
+    return is_device_type(device, 'xla')
+
 def is_directml_enabled():
     global directml_enabled
     if directml_enabled:
@@ -1592,6 +1649,9 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
 
     if cpu_mode():
         return False
+
+    if is_neuron():
+        return False  # prefer bf16 on Neuron
 
     if is_intel_xpu():
         return torch.xpu.get_device_properties(device).has_fp16
@@ -1659,6 +1719,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
     if cpu_mode():
         return False
 
+    if is_neuron():
+        return True
+
     if is_intel_xpu():
         return torch.xpu.is_bf16_supported()
 
@@ -1696,6 +1759,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
 def supports_fp8_compute(device=None):
     if SUPPORT_FP8_OPS:
         return True
+
+    if is_neuron():
+        return False
 
     if not is_nvidia():
         return False
@@ -1744,6 +1810,9 @@ def supports_fp64(device=None):
     if is_device_mps(device):
         return False
 
+    if is_neuron():
+        return False
+
     if is_intel_xpu():
         return False
 
@@ -1781,6 +1850,10 @@ def synchronize():
         return
     if is_intel_xpu():
         torch.xpu.synchronize()
+    elif is_neuron():
+        import torch_xla.core.xla_model as _xm
+        _xm.mark_step()
+        _xm.wait_device_ops()
     elif torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -1797,6 +1870,10 @@ def soft_empty_cache(force=False):
         torch.npu.empty_cache()
     elif is_mlu():
         torch.mlu.empty_cache()
+    elif is_neuron():
+        import torch_xla.core.xla_model as _xm
+        _xm.mark_step()
+        gc.collect()
     elif torch.cuda.is_available():
         torch.cuda.synchronize()
         torch.cuda.empty_cache()

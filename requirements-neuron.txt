@@ -1,0 +1,9 @@
+--extra-index-url https://pip.repos.neuron.amazonaws.com
+
+torch==2.7.*
+torchvision==0.22.*
+torchaudio==2.7.*
+torch-xla==2.7.*
+torch-neuronx
+neuronx-cc
+libneuronxla
